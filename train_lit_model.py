@@ -1,31 +1,29 @@
 """
 Runs a model on a single node across multiple gpus.
 """
-import warnings
-warnings.simplefilter(action='ignore', category=FutureWarning)
 import os
 from pathlib import Path
 from argparse import ArgumentParser
 from LitModel import *
-import torch
-from pytorch_lightning import Trainer, seed_everything
-from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
-from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.callbacks import LearningRateLogger
-from pytorch_lightning.utilities.distributed import rank_zero_only
-from pytorch_lightning.callbacks import Callback
+from lightning import Trainer, seed_everything
+from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.loggers import TensorBoardLogger
+from lightning.pytorch.callbacks import LearningRateMonitor
 
 seed_everything(1994)
 
 def setup_callbacks_loggers(args):
     
-    log_path = Path('/home/yyousfi1/LogFiles/comma/')
+    log_path = Path('./logs')
     name = args.backbone
     version = args.version
     tb_logger = TensorBoardLogger(log_path, name=name, version=version)
-    lr_logger = LearningRateLogger(logging_interval='epoch')
-    ckpt_callback = ModelCheckpoint(filepath=Path(tb_logger.log_dir)/'checkpoints/{epoch:02d}_{val_loss:.4f}', 
-                                    save_top_k=10, save_last=True)
+    lr_logger = LearningRateMonitor(logging_interval='epoch')
+    ckpt_callback = ModelCheckpoint(dirpath=Path(tb_logger.log_dir)/'checkpoints',
+                                    filename='{epoch:02d}_{val_loss:.4f}',
+                                    save_top_k=10,
+                                    monitor="val/loss",
+                                    save_last=True)
    
     return ckpt_callback, tb_logger, lr_logger
 
@@ -41,25 +39,22 @@ def main(args):
 
     ckpt_callback, tb_logger, lr_logger = setup_callbacks_loggers(args)
     
-    trainer = Trainer(checkpoint_callback=ckpt_callback,
-                     logger=tb_logger,
-                     callbacks=[lr_logger],
-                     gpus=args.gpus,
+    trainer = Trainer(logger=tb_logger,
+                     callbacks=[lr_logger, ckpt_callback],
+                     devices=args.gpus,
                      min_epochs=args.epochs,
                      max_epochs=args.epochs,
                      precision=16,
-                     amp_backend='native',
-                     row_log_interval=100,
-                     log_save_interval=100,
-                     distributed_backend='ddp',
+                     log_every_n_steps=100,
+                     strategy='ddp_find_unused_parameters_true',
                      benchmark=True,
                      sync_batchnorm=True,
-                     resume_from_checkpoint=args.resume_from_checkpoint)
     
+                     )
     
     trainer.logger.log_hyperparams(model.hparams)
     
-    trainer.fit(model)
+    trainer.fit(model, ckpt_path=args.seed_from_checkpoint)
 
 
 def run_cli():

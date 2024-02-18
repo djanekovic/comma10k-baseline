@@ -1,12 +1,11 @@
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
-import pandas as pd
 import numpy as np
 import pickle
 import cv2
 import albumentations as A
 from albumentations.core.composition import Compose
-from typing import Callable, List
+from typing import Callable, List, Tuple
 from pathlib import Path
 import os
 from torch.utils.data import Dataset
@@ -22,14 +21,14 @@ def get_train_transforms(height: int = 437,
     if level == 'light':
         return A.Compose([
                 A.HorizontalFlip(p=0.5),
-                A.IAAAdditiveGaussianNoise(p=0.2),
+                A.GaussNoise(p=0.2),
                 A.OneOf(
                     [A.CLAHE(p=1.0),
                     A.RandomBrightness(p=1.0),
                     A.RandomGamma(p=1.0),
                     ],p=0.5),
                 A.OneOf(
-                    [A.IAASharpen(p=1.0),
+                    [A.Sharpen(p=1.0),
                     A.Blur(blur_limit=3, p=1.0),
                     A.MotionBlur(blur_limit=3, p=1.0),
                     ],p=0.5),
@@ -48,7 +47,7 @@ def get_train_transforms(height: int = 437,
     elif level == 'hard':
         return A.Compose([
                 A.HorizontalFlip(p=0.5),
-                A.IAAAdditiveGaussianNoise(p=0.2),
+                A.GaussNoise(p=0.2),
                 A.OneOf(
                     [A.GridDistortion(border_mode=cv2.BORDER_CONSTANT, value=0, mask_value=0, p=1.0),
                      A.ElasticTransform(alpha_affine=10, border_mode=cv2.BORDER_CONSTANT, value=0, mask_value=0, p=1.0),
@@ -70,7 +69,7 @@ def get_train_transforms(height: int = 437,
                     A.ISONoise(p=1.0)
                     ],p=0.5),
                 A.OneOf(
-                    [A.IAASharpen(p=1.0),
+                    [A.Sharpen(p=1.0),
                     A.Blur(blur_limit=3, p=1.0),
                     A.MotionBlur(blur_limit=3, p=1.0),
                     ],p=0.5),
@@ -111,7 +110,7 @@ def get_train_transforms(height: int = 437,
                     A.ISONoise(p=1.0)
                     ],p=0.5),
                 A.OneOf(
-                    [A.IAASharpen(p=1.0),
+                    [A.Sharpen(p=1.0),
                     A.Blur(blur_limit=3, p=1.0),
                     A.MotionBlur(blur_limit=3, p=1.0),
                     ],p=0.5),
@@ -151,7 +150,7 @@ def to_tensor(x, **kwargs):
 def get_preprocessing(preprocessing_fn: Callable):
     _transform = [
         A.Lambda(image=preprocessing_fn),
-        A.Lambda(image=to_tensor, mask=to_tensor),
+        A.Lambda(image=to_tensor),
     ]
     return A.Compose(_transform)
 
@@ -162,7 +161,7 @@ class TrainRetriever(Dataset):
                  image_names: List[str], 
                  preprocess_fn: Callable, 
                  transforms: Compose,
-                 class_values: List[int]):
+                 class_values: List[Tuple[int]]):
         super().__init__()
         
         self.data_path = data_path
@@ -172,27 +171,36 @@ class TrainRetriever(Dataset):
         self.class_values = class_values
         self.images_folder = 'imgs'
         self.masks_folder = 'masks'
+    
+    def mask_to_class_idx(self, maskimg):
+        mask = torch.zeros(maskimg.shape[:2], dtype=torch.long)
+        
+        for i, class_value in enumerate(self.class_values):
+            idx = maskimg == class_value
+            validx = idx.sum(2) == 3
+            mask[validx] = i
+
+        return mask
 
     def __getitem__(self, index: int):
-        
         image_name = self.image_names[index]
         
         image = cv2.imread(str(self.data_path/self.images_folder/image_name))
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        mask = cv2.imread(str(self.data_path/self.masks_folder/image_name), 0).astype('uint8')
-
+        mask = cv2.imread(str(self.data_path/self.masks_folder/image_name))
+        mask = cv2.cvtColor(mask, cv2.COLOR_BGR2RGB)
+        
         if self.transforms:
             sample = self.transforms(image=image, mask=mask)
             image = sample['image']
             mask = sample['mask']
 
-        mask = np.stack([(mask == v) for v in self.class_values], axis=-1).astype('uint8')
 
         if self.preprocess:
-            sample = self.preprocess(image=image, mask=mask)
+            sample = self.preprocess(image=image)
             image = sample['image']
-            mask = sample['mask']
+            mask = self.mask_to_class_idx(mask)
 
         return image, mask
 

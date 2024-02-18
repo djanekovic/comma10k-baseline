@@ -1,26 +1,19 @@
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
-import pandas as pd
 import numpy as np 
-import pickle
 import argparse
-from collections import OrderedDict
 from pathlib import Path
-from tempfile import TemporaryDirectory
-from typing import Optional, Generator, Union
+from typing import Union, List, Tuple
 import torch
-import torch.nn.functional as F
-from torch import optim
-from torch.nn import Module
 from torch.utils.data import DataLoader
-import pytorch_lightning as pl
-from pytorch_lightning import _logger as log
+import lightning as L
+from lightning import _logger as log
 import random
 from retriever import *
-from pytorch_lightning.metrics.converters import _sync_ddp_if_available
+from torchmetrics.classification import MulticlassAccuracy
 import segmentation_models_pytorch as smp
 
-class LitModel(pl.LightningModule):
+class LitModel(L.LightningModule):
     """Transfer Learning
     """
     def __init__(self,
@@ -36,7 +29,14 @@ class LitModel(pl.LightningModule):
                  epochs: int = 50, 
                  gpus: int = 1, 
                  weight_decay: float = 1e-3,
-                 class_values: List[int] = [41,  76,  90, 124, 161, 0] # 0 added for padding
+                 class_values: List[Tuple[int]] = [
+                    (128, 32,  32),  #402020 - road
+                    (255, 0,   0),   #ff0000 - lane markings
+                    (128, 128, 96),  #808060 - undrivable
+                    (0,   255, 102), #00ff66 - movable
+                    (204, 0,   255), #cc00ff - my car
+                    (0,   204, 255), #00ccff - movable in my car
+                ]
                  ,**kwargs) -> None:
         
         super().__init__()
@@ -56,23 +56,14 @@ class LitModel(pl.LightningModule):
         
         self.save_hyperparameters()
 
-        self.train_custom_metrics = {'train_acc': smp.utils.metrics.Accuracy(activation='softmax2d')}
-        self.validation_custom_metrics = {'val_acc': smp.utils.metrics.Accuracy(activation='softmax2d')}
+        self.train_custom_metrics = torch.nn.ModuleDict({'acc': MulticlassAccuracy(num_classes=len(class_values))})
+        self.validation_custom_metrics = torch.nn.ModuleDict({'acc': MulticlassAccuracy(num_classes=len(class_values))})
 
         self.preprocess_fn = smp.encoders.get_preprocessing_fn(self.backbone, pretrained='imagenet')
-        
-        self.__build_model()
-
-    def __build_model(self):
-        """Define model layers & loss."""
-
-        # 1. net:
-
         self.net = smp.Unet(self.backbone, classes=len(self.class_values), 
                             activation=None, encoder_weights='imagenet')
-
-        # 2. Loss:
-        self.loss_func = lambda x, y: torch.nn.CrossEntropyLoss()(x, torch.argmax(y,axis=1))
+        
+        self.loss = torch.nn.CrossEntropyLoss()
 
     def forward(self, x):
         """Forward pass. Returns logits."""
@@ -80,10 +71,6 @@ class LitModel(pl.LightningModule):
         x = self.net(x)
         
         return x
-
-    def loss(self, logits, labels):
-        """Use the loss_func"""
-        return self.loss_func(logits, labels)
 
     def training_step(self, batch, batch_idx):
 
@@ -94,16 +81,11 @@ class LitModel(pl.LightningModule):
         # 2. Compute loss & accuracy:
         train_loss = self.loss(y_logits, y)
         
-        metrics = {}
-        for metric_name in self.train_custom_metrics.keys():
-            metrics[metric_name] = self.train_custom_metrics[metric_name](y_logits, y)
+        self.log("train/loss", train_loss, prog_bar=True, logger=True, on_epoch=True, on_step=False, sync_dist=True)
+        metrics = {f"train/{metric_name}": metric(y_logits, y) for metric_name, metric in self.train_custom_metrics.items()}
+        self.log_dict(metrics, prog_bar=True, logger=True, on_epoch=True, on_step=False, sync_dist=True)
 
-        # 3. Outputs:        
-        output = OrderedDict({'loss': train_loss,
-                              'log': metrics,
-                              'progress_bar': metrics})
-
-        return output
+        return train_loss
 
     def validation_step(self, batch, batch_idx):
         
@@ -114,26 +96,11 @@ class LitModel(pl.LightningModule):
         # 2. Compute loss & accuracy:
         val_loss = self.loss(y_logits, y)
         
-        metrics = {'val_loss': val_loss}
-
-        for metric_name in self.validation_custom_metrics.keys():
-            metrics[metric_name] = self.validation_custom_metrics[metric_name](y_logits, y)
+        self.log("val/loss", val_loss, prog_bar=True, logger=True, on_epoch=True, on_step=False, sync_dist=True)
+        metrics = {f"val/{metric_name}": metric(y_logits, y) for metric_name, metric in self.validation_custom_metrics.items()}
+        self.log_dict(metrics, prog_bar=True, logger=True, on_epoch=True, on_step=False, sync_dist=True)
                 
-        return metrics
-    
-    def validation_epoch_end(self, outputs):
-        """Compute and log training loss and accuracy at the epoch level.
-        Average statistics accross GPUs in case of DDP
-        """
-        keys = outputs[0].keys()          
-        metrics = {}
-        for metric_name in keys:
-            metrics[metric_name] = _sync_ddp_if_available(torch.stack([output[metric_name] for output in outputs]).mean(), reduce_op='avg')
-                        
-        metrics['step'] = self.current_epoch    
-            
-        return {'log': metrics}
-
+        return val_loss
 
     def configure_optimizers(self):
 
@@ -166,7 +133,6 @@ class LitModel(pl.LightningModule):
         print('data ready')
 
     def setup(self, stage: str): 
-
         image_names = np.loadtxt(self.data_path/'files_trainable', dtype='str').tolist()
             
         random.shuffle(image_names)
